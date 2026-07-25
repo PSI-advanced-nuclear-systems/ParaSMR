@@ -1,0 +1,11 @@
+# CAD/Geometry Libraries
+cadquery==2.7.0
+Shapely==2.1.2
+ocp_vscode==3.1.2
+
+# Scientific Computing
+numpy
+
+# Utilities
+python-dotenv
+openpyxl

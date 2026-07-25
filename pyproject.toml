@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ZeroLevelProduct"
+version = "0.12.0"
+description = "Parametric 3D CAD library for pool-type sodium-cooled fast reactor components (MSc thesis tool)"
+authors = [{name = "Suarez Gerona", email = "pilarsuager@gmail.com"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "cadquery==2.7.0",
+    "Shapely==2.1.2",
+    "ocp_vscode==3.1.2",
+    "numpy",
+    "python-dotenv",
+    "openpyxl",
+]
+
+[tool.setuptools]
+py-modules = [
+    "assemble",
+    "build_3D_solid",
+    "component_anchors",
+    "component_material_zones",
+    "component_resolver",
+    "components_3D_primitives",
+    "cost_report",
+    "homogenise",
+    "homogenise_assembly",
+    "materials",
+    "profile_built_in_2D_sketch",
+    "profile_from_straight_connections",
+    "utils",
+]
+packages = ["components_premade"]

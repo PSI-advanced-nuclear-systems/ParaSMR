@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+
+# Generated CAD outputs
+/output/
+examples_reactor/output/
+examples_reactor/sealer55_detailed.step
+examples_reactor/sealer_55_detailed.step
+
+# Internal AI / working notes
+main_claude.md
+claude_mds/
+
+# macOS
+.DS_Store
