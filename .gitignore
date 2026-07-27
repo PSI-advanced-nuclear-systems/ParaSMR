@@ -19,5 +19,8 @@ examples_reactor/sealer_55_detailed.step
 main_claude.md
 claude_mds/
 
+# Docs
+docs/
+
 # macOS
 .DS_Store
