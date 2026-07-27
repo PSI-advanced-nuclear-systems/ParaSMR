@@ -169,6 +169,7 @@ def homogenise_assembly(
     materials: Optional[Dict[str, Dict[str, Any]]] = None,
     pool: Optional[Dict[str, Any]] = None,
     settings: Optional[Dict[str, Any]] = None,
+    units: Optional[str] = None,
     out_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -178,6 +179,14 @@ def homogenise_assembly(
 
     pool     : {"material": "na_primary"}  (required key: material)
     settings : {"particles": .., "batches": .., "inactive": ..} merged over defaults
+    units    : PURE LABEL — the length unit the spec numbers are authored in
+               (e.g. "m", "cm"), exactly like assemble_objects()'s ``units=``.
+               Nothing is rescaled; the homogenisation stays unit-agnostic (only
+               volume ratios are used). It is recorded verbatim in the model's
+               ``unit`` field so a downstream reader (e.g. a future OpenMC
+               exporter, which requires cm) knows what the geometry lengths mean
+               and can convert them. ``None`` leaves the unit unspecified.
+               Number densities are ALWAYS atoms/b·cm, independent of this label.
     """
     if materials is None:
         from materials import MATERIALS as materials
@@ -359,7 +368,11 @@ def homogenise_assembly(
 
     model = {
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
-        "unit": "model units (unit-agnostic; number densities are atoms/b·cm)",
+        # Length unit the geometry is authored in, as declared by the caller
+        # (a pure label — nothing was rescaled). None => unspecified. A reader
+        # that needs a concrete unit (OpenMC wants cm) converts from this.
+        "unit": units,
+        "number_density_unit": "atoms/b·cm",
         "components": components,
         "pool": pool_out,
         "vessel": vessel_out,
@@ -404,9 +417,11 @@ def _single_material(spec: Dict[str, Any], what: str) -> str:
 def to_cad_specs(model: Dict[str, Any], prefix: str = "hom_") -> List[Dict[str, Any]]:
     """
     The homogenised model as a spec list assemble_objects() can build directly:
-    one cylinder primitive per component plus the vessel as a pipe. These cells
-    do not overlap one another, so the CAD assembly's own overlap detection acts
-    as an independent check on the equivalent-cylinder layout.
+    one cylinder primitive per component, the vessel wall as a pipe, and — when
+    it has positive thickness — the vessel's equivalent flat bottom as a solid
+    disc closing the bore. These cells do not overlap one another, so the CAD
+    assembly's own overlap detection acts as an independent check on the
+    equivalent-cylinder layout.
 
     Each spec carries its homogenised composition in "number_densities" for the
     downstream OpenMC export; assemble_objects ignores the key.
@@ -434,6 +449,21 @@ def to_cad_specs(model: Dict[str, Any], prefix: str = "hom_") -> List[Dict[str, 
         "material": v["material"],
         "number_densities": v["number_densities"],
     })
+    # Equivalent flat bottom: a solid disc (full outer radius) that closes the
+    # bore just below the annular wall and carries the vessel steel the annulus
+    # doesn't. Drawn only when it has positive thickness — t_bottom_eq is clamped
+    # to 0 when the modelled annulus already accounts for all the CAD steel.
+    t_bottom = v.get("bottom_plate_thickness", 0.0)
+    if t_bottom > 0.0:
+        specs.append({
+            "obj_type": "cylinder",
+            "obj_id": f"{prefix}vessel_bottom",
+            "radius": v["r_outer"],
+            "height": t_bottom,
+            "center_coords": (0.0, 0.0, v["z_bottom"] - t_bottom / 2.0),
+            "material": v["material"],
+            "number_densities": v["number_densities"],
+        })
     return specs
 
 
