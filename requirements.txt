@@ -6,6 +6,5 @@ ocp_vscode==3.1.2
 # Scientific Computing
 numpy
 
-# Utilities
-python-dotenv
-openpyxl
+# Neutronics — only needed for IntegrationOpenMC/, install via conda:
+#   conda install -c conda-forge openmc
