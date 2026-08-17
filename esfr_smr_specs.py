@@ -1,32 +1,15 @@
 """
-Homogenised twin of example_final_esfr_smr.py.
+SPECS for the ESFR-SMR, copied verbatim from
+    examples_reactor/example_final_esfr_smr_with_materials_cm.py
+so the TRACE tooling has a source it can import without triggering the
+example's top-level homogenisation (which writes a JSON on import).
 
-Same geometry dicts, same resolver, same placement — each component simply
-carries a material assignment as well. The homogeniser turns them into
-atom-conserving equivalent cylinders and hands them back as CAD.
+UNITS: centimetres — identical to the example.
 
-Zone names come from component_material_zones.py:
-    ihx           structure / tube_side / shell_side
-    diagrid       shell / cavity
-    reactor_core  core
-    everything else (pump, strongback, above-core structure, redan, vessel,
-                     plate)  ->  one "structure" zone
-"_filler" is what fills the equivalent cylinder around the component: pool
-sodium, not vacuum.
-
-UNITS: centimetres. Every geometry value below is in cm — the metre-based
-values of example_final_esfr_smr.py multiplied by 100 — so the homogenised
-model is already in the unit OpenMC expects and needs no rescaling downstream.
+DRIFT WARNING: this is a copy. If the geometry in the example changes, re-sync
+the affected blocks here. The values below are the flow-relevant heterogeneous
+geometry (tube_rings, barrel, diagrid, ...) that nodalization.py reads.
 """
-
-import datetime
-
-from assemble import assemble_objects
-from ocp_vscode import show
-from materials import MATERIALS
-from homogenise import (
-    homogenise_objects, build_cad, check_against_cad, print_report,
-)
 
 _SB_Z_BOTTOM      = -170.2
 _DIAGRID_Z_BOTTOM = _SB_Z_BOTTOM + 124.2
@@ -174,8 +157,6 @@ REDAN = {
     "z_bottom":   _DIAGRID_TOP_Z,
     "thickness":  2.5,
     "z_shoulder": 650.0,
-    # smeared into the pool (see _TREATMENT): a cylinder of r_top would
-    # swallow the IHXs and pumps.
     "material":   STEEL,
 }
 
@@ -210,64 +191,3 @@ SPECS = [
     _make_pump("pump_1", 60.0), _make_pump("pump_2", 180.0), _make_pump("pump_3", 300.0),
     DIAGRID, CORE, STRONGBACK, REDAN, ABOVE_CORE_STRUCTURE,
 ]
-from ocp_vscode import show
-#show(assemble_objects(SPECS))
-
-_TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-# assemble_objects(
-#         SPECS,
-#         export_path=f"output/esfr_smr_full_reactor_{_TS}.step",
-#         units="cm",
-#     )
-
-# The homogenised twin of the same SPECS — atom-conserving equivalent cylinders
-# in a sodium pool — in the OCP CAD Viewer. The material library is the default,
-# so the only thing the specs above needed was their "materials" blocks.
-#show(build_cad(homogenise_objects(SPECS)))
-
-# Both geometries at once, from the same SPECS list: the real one solid, the
-# equivalent cylinders translucent on top of it. Each is its own branch of the
-# viewer tree, so either can be toggled off.
-# show(
-#     assemble_objects(SPECS),
-#     build_cad(homogenise_objects(SPECS)),
-#     names=["heterogeneous", "homogenised"],
-#     alphas=[1.0, 0.35],
-# )
-
-
-
-homogenise_objects(
-    SPECS,
-    MATERIALS,
-    pool={"material": NA1},
-    units="cm",                      # label only — this model is authored in centimetres
-    out_path=f"output/homogenised_model_cm{_TS}.json",
-)
-
-
-
-
-# if __name__ == "__main__":
-#     _TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-#     model = homogenise_objects(
-#         SPECS,
-#         MATERIALS,
-#         pool={"material": NA1},
-#         out_path=f"output/homogenised_model_{_TS}.json",
-#     )
-
-#     # Independent check: placement and inventory against the real CAD assembly.
-#     cad_check = check_against_cad(model, SPECS)
-#     print_report(model, cad_check)
-
-#     # The homogenised model as CAD. "cm" is only needed because STEP demands a
-#     # unit declaration — nothing above this line knew or cared.
-#     assy = build_cad(
-#         model,
-#         export_path=f"output/homogenised_esfr_{_TS}.step",
-#         units="cm",
-#     )
-#     show(assy)

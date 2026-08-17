@@ -23,8 +23,8 @@ import datetime
 from assemble import assemble_objects
 from ocp_vscode import show
 from materials import MATERIALS
-from homogenise_assembly import (
-    homogenise_assembly, build_cad, check_against_cad, print_report,
+from homogenise import (
+    homogenise_objects, build_cad, check_against_cad, print_report,
 )
 
 _SB_Z_BOTTOM      = -1.702
@@ -217,27 +217,26 @@ _TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 #         SPECS,
 #         export_path=f"output/esfr_smr_full_reactor_{_TS}.step",
 #         units="m",
-#         costs_report=True,
 #     )
 
 # The homogenised twin of the same SPECS — atom-conserving equivalent cylinders
 # in a sodium pool — in the OCP CAD Viewer. The material library is the default,
 # so the only thing the specs above needed was their "materials" blocks.
-show(build_cad(homogenise_assembly(SPECS)))
+show(build_cad(homogenise_objects(SPECS)))
 
 # Both geometries at once, from the same SPECS list: the real one solid, the
 # equivalent cylinders translucent on top of it. Each is its own branch of the
 # viewer tree, so either can be toggled off.
 # show(
 #     assemble_objects(SPECS),
-#     build_cad(homogenise_assembly(SPECS)),
+#     build_cad(homogenise_objects(SPECS)),
 #     names=["heterogeneous", "homogenised"],
 #     alphas=[1.0, 0.35],
 # )
 
 
 """
-homogenise_assembly(
+homogenise_objects(
     SPECS,
     MATERIALS,
     pool={"material": NA1},
@@ -251,7 +250,7 @@ homogenise_assembly(
 # if __name__ == "__main__":
 #     _TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-#     model = homogenise_assembly(
+#     model = homogenise_objects(
 #         SPECS,
 #         MATERIALS,
 #         pool={"material": NA1},

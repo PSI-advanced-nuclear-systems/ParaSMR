@@ -1,26 +1,3 @@
-"""
-Example user assembly — paramak-style.
-
-The user writes ONLY geometric parameters. There are no `center_coords`,
-no `rotation_angles`, no cross-component fields like `nozzle_z_abs` on
-the diagrid. The resolver fills those in by inspecting which components
-are in the assembly and applying its connection rules.
-
-How the user influences placement:
-  • Each component declares its OWN positioning intent in human terms
-    (e.g. a pump declares `at_angle_deg` and `at_radius`).
-  • Diagrid/strongback/etc. just declare `z_bottom` (vertical stack).
-  • The resolver does the rest.
-
-Manual override
-  • To bypass the resolver for one component, set both `center_coords`
-    and `rotation_angles` explicitly — the resolver will respect them
-    and only fill in cross-component params on the OTHER side of the
-    connection (e.g. boss angles on the diagrid).
-  • To remove a component from resolver consideration entirely, set
-    `manual_placement: True`.
-"""
-
 import math
 import datetime
 from assemble import assemble_objects
@@ -37,8 +14,7 @@ _CORE_HEIGHT       = 3.910
 _RV_STRAIGHT_H = 9.0
 
 _PUMP_BARREL_H = 12.0
-_PUMP_CENTER_Z = _RV_STRAIGHT_H + 0.5 - _PUMP_BARREL_H / 2  # barrel top flush with plate top
-
+_PUMP_CENTER_Z = _RV_STRAIGHT_H + 0.5 - _PUMP_BARREL_H / 2
 
 
 RV = {
@@ -59,9 +35,8 @@ TOP_PLATE = {
     "z_bottom":  _RV_STRAIGHT_H,
 }
 
-# IHX placement is resolver-driven: _resolve_ihx_topplate sets center_coords
-# so the bundle window top lands one upper_plenum_wall below the top plate bottom.
 _IHX_R = 3.200
+
 def _make_ihx(obj_id, angle_deg):
     return {
         "obj_type":     "ihx",
@@ -101,8 +76,6 @@ IHX3 = _make_ihx("ihx_3", 240.0)
 def _make_pump(obj_id, angle_deg):    return {
         "obj_type":          "primary_pump",
         "obj_id":            obj_id,
-
-
         "barrel_radius":     1.350 / 2,
         "barrel_wall_t":     0.040,
         "barrel_height":     _PUMP_BARREL_H,
@@ -161,22 +134,11 @@ STRONGBACK = {
     "z_bottom":               _SB_Z_BOTTOM,
 }
 
-# Half-section A → B → C revolved 360° about Z. The polyline is the OUTER
-# surface of the shell; the wall grows inward by "thickness".
-#   A = top plate ∩ RPV inner wall      → (RV inner radius, top of RV shell)
-#   B = top of core                     → (redan lower radius, core top)
-#   C = top of the diagrid              → (redan lower radius, diagrid top)
-# The lower cylinder rests on the top face of the diagrid, so r_lower is
-# kept below the diagrid outer radius (r=2.330) and above the core radius
-# (r=1.800). The optional z_shoulder gives a cylindrical top section before
-# Note: this simple revolved shell has no penetrations for the IHX bundles
-# or the pump nozzles, so overlap warnings from assemble_objects are
-# expected where the redan crosses those components — those cutouts are a
-_REDAN_R_TOP      = 8.91 / 2                              # RV inner radius (= RV.inner_d / 2)
-_REDAN_R_LOWER    = 2.200                                 # clears core (r=1.800), fits on diagrid (r=2.330)    
-_REDAN_Z_KNEE     = _CORE_Z_BOTTOM + _CORE_HEIGHT         # core top
-_REDAN_Z_BOTTOM   = _DIAGRID_TOP_Z                        # rests on top of the diagrid
-_REDAN_Z_SHOULDER = 6.500                                 # top cylindrical section ends here
+_REDAN_R_TOP      = 8.91 / 2
+_REDAN_R_LOWER    = 2.200
+_REDAN_Z_KNEE     = _CORE_Z_BOTTOM + _CORE_HEIGHT
+_REDAN_Z_BOTTOM   = _DIAGRID_TOP_Z
+_REDAN_Z_SHOULDER = 6.500
 
 REDAN = {
     "obj_type":       "redan",
@@ -190,18 +152,9 @@ REDAN = {
     "z_shoulder":     _REDAN_Z_SHOULDER,
 }
 
-# The component's lower shell (bottom ring + cone + neck) sits on the
-# component's local origin, and the top cylinder is displaced sideways by
-# top_cyl_offset_x. This way the cone — and the hex through-hole pattern
-# beneath it — can be aligned with the reactor core via the assembly's
-# center_coords (which the assembler defaults to (0, 0, …)), while the top
-# cylinder is offset so it doesn't clash with the pumps / IHX nozzles.
-# Positioned vertically so the lower part of the neck registers into the top
-#   z2 (cone top = neck bottom, local) + z_bottom = top_plate bottom (world)
 _ACS_TOP_CYL_HEIGHT      = 1.008
 _ACS_CONE_HEIGHT         = 2.429
-_ACS_BOTTOM_RING_HEIGHT  = 0.498  
-# collar band (0.092) into the neck (0.569) so the geometry is unchanged.
+_ACS_BOTTOM_RING_HEIGHT  = 0.498
 _ACS_NECK_HEIGHT         = 0.661
 
 ABOVE_CORE_STRUCTURE = {

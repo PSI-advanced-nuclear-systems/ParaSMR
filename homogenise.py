@@ -1,402 +1,642 @@
 """
-Homogenise any component into an equivalent cylinder that conserves the
-number of atoms of every nuclide.
+Assembly-level homogenisation: the neutronics twin of assemble_objects().
 
-Three-way separation of concerns
-────────────────────────────────
-  materials.py                what a material IS        (composition library)
-  component_material_zones.py what ZONES a component has (per-component, by obj_type)
-  spec["materials"]           which material fills each zone (assignment, by zone name)
+Takes the SAME list of component dicts the CAD assembly uses (each extended
+with a ``materials`` or ``material`` block) and produces a homogenised model:
+the reactor as a set of placed, atom-conserving equivalent cylinders inside a
+sodium pool and a native vessel. The model can be
 
-UNITS — the tool is UNIT-AGNOSTIC, exactly like assemble_objects(). Geometry is
-never converted to centimetres and volumes are never turned into absolute atom
-counts. The homogenisation identity is written in terms of volume FRACTIONS::
+  • turned back into CAD          build_cad(model)  ->  cq.Assembly  (+ STEP)
+  • written out as JSON           out_path=...      ->  handed to an OpenMC
+                                                        exporter later
 
-        n_hom,i  =  Σ_m  (V_m / V_cyl) · n_m,i
+UNITS: unit-agnostic, exactly like assemble_objects(). Every length, area and
+volume below is in the model's own unit; the homogenisation identity uses only
+volume RATIOS, so nothing needs to know what that unit is. A unit is required
+in exactly one place — the ``units=`` argument of build_cad(), and only when
+exporting STEP, because the file format demands a length declaration. See the
+module docstring of homogenise_solid.py for the conservation identity.
 
-V_m / V_cyl is dimensionless, so it does not matter whether the model is in
-metres, millimetres or furlongs — as long as one unit is used consistently. The
-resulting n_hom,i comes out in the same units as the library's n_m,i
-(atoms/b·cm), and conservation holds under any consistent unit choice:
+Pipeline
+────────
+  1. resolve(specs)            same resolver as the CAD assembly, so every
+                               component lands at the same world position
+     auto_generate_topplate_holes(specs)
+                               same pre-pass as the CAD assembly, so the top
+                               plate is measured WITH its penetrations
+  2. per component, by type:
+       cylinder (default)      homogenise_solid() -> equivalent cylinder, placed at
+                               the resolved position; identical geometries
+                               (e.g. 3 IHXs) are built once and reused
+       vessel                  reactor_vessel: kept native — annular shell +
+                               equivalent flat bottom conserving the CAD
+                               steel volume (heads included)
+       plate                   reactor_top_plate: kept native — slab minus the
+                               penetrating cylinders, steel smeared so the CAD
+                               plate volume is conserved
+       smear                   redan: steel smeared uniformly into the pool
+  3. pool                      vessel interior minus all component cylinders,
+                               filled with the pool material + smeared steel
+  4. QA                        pairwise cylinder-overlap check, per-component
+                               atom balance, volume closure, placement echo
 
-        V_cyl · n_hom,i  ==  Σ_m V_m · n_m,i           (for every nuclide i)
+Treatment can be forced per spec with ``"neutronics_treatment":
+"cylinder" | "smear" | "skip"``; envelopes resized with ``"hom_cylinder"``.
 
-A length unit is needed only when the model is handed to a code that demands
-one — the future OpenMC export — which is where assemble_objects() puts it too.
-
-Three build paths
-─────────────────
-Components reach this module by any of the routes build_solid() supports:
-
-    premade components        obj_type in PREMADE_BUILDERS
-    2D profile + operation    spec["profile"] + extrude / revolve / sweep
-    CadQuery 3D primitives    obj_type in {cylinder, box, pipe, sphere, ...}
-
-If the obj_type has an entry in MATERIAL_ZONES, that entry decides the zones
-(this is how the IHX separates tube-side from shell-side sodium). Otherwise the
-component is treated generically: it is built through the very same build_solid()
-call the assembler uses, and becomes ONE zone of one material — which is all a
-single-material component ever needs. No registration required.
-
-Filler (closure rule)
-─────────────────────
-The equivalent cylinder is usually larger than the sum of the declared zones.
-The remainder ``V_cyl − Σ V_zones`` is the FILLER — in a pool reactor this is
-the surrounding sodium, not vacuum. Assign it with the reserved key::
-
-    "materials": {"structure": "ss316", "_filler": "na_primary"}
-
-or, on a single-material component, with the top-level ``"filler"`` key::
-
-    {"obj_type": "cylinder", "material": "ss316", "filler": "na_primary", ...}
-
-If no filler is given the remainder is left as vacuum (reported in the result as
-``unfilled``). A negative remainder (zones bigger than the cylinder) is always an
-error — enlarge the envelope or fix the zones.
-
-The envelope can be overridden per spec with ``spec["hom_cylinder"]``
-(partial dict, e.g. ``{"radius": 2.2}``) — useful to shrink a component's
-cylinder so it does not overlap a neighbour; atoms stay conserved.
+PLACEMENT: build_solid() rotates a component about its LOCAL ORIGIN and then
+translates that origin onto ``center_coords`` (utils.place_origin_at). So a
+component's world geometry is its local geometry plus center_coords, and the
+equivalent cylinder is placed the same way — see _world_cylinder.
 """
 
 from __future__ import annotations
 
+import copy
+import datetime
+import hashlib
+import json
 import math
-from collections import defaultdict
-from typing import Any, Dict, Optional
+import os
+import warnings
+from typing import Any, Dict, List, Optional
 
-from component_material_zones import MATERIAL_ZONES, Zone
-
-N_A = 6.02214076e23  # Avogadro, atoms / mol
-
-FILLER_KEY = "_filler"   # reserved name in spec["materials"] for the closure material
-SOLID_ZONE = "solid"     # zone name used by the generic single-material path
-
-# Keys that carry assembly / homogenisation metadata rather than geometry. They
-# are stripped before a spec is handed to build_solid, which would otherwise
-# choke on them as unexpected keyword arguments on the profile-based path.
-_NON_GEOMETRY_KEYS = (
-    "material", "materials", "material_tag", "filler", "hom_cylinder",
-    "neutronics_treatment", "color", "insert_into", "interfaces_with",
-    "manual_placement", "auto_hole", "hole_diameter",
+from component_material_zones import MATERIAL_ZONES
+from homogenise_solid import (
+    FILLER_KEY,
+    cylinder_volume,
+    generic_zones,
+    homogenise_solid,
+    homogenise_volumes,
+    material_number_densities,
 )
 
+# Default treatment per obj_type (override with spec["neutronics_treatment"])
+_TREATMENT = {
+    "reactor_vessel":    "vessel",
+    "reactor_top_plate": "plate",
+    "redan":             "smear",
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MATERIALS  (pure python)
-# ─────────────────────────────────────────────────────────────────────────────
-def material_number_densities(mat: Dict[str, Any]) -> Dict[str, float]:
+# Keys that do not change the homogenisation result — stripped for the
+# geometry cache so identical components (3 IHXs, 3 pumps) are built once.
+_PLACEMENT_KEYS = {
+    "obj_id", "name", "color", "operation", "insert_into", "interfaces_with",
+    "at_radius", "at_angle_deg", "center_coords", "center_coords_pol",
+    "rotation_angles", "manual_placement", "neutronics_treatment",
+}
+
+
+def _cache_key(spec: Dict[str, Any]) -> str:
+    payload = {k: v for k, v in spec.items() if k not in _PLACEMENT_KEYS}
+    return hashlib.md5(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def _treatment(spec: Dict[str, Any]) -> str:
+    return spec.get("neutronics_treatment") or _TREATMENT.get(spec["obj_type"], "cylinder")
+
+
+def _world_cylinder(spec: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, float]:
     """
-    Per-nuclide number densities in atoms/b·cm. Two accepted forms:
+    Place the local-frame equivalent cylinder at the component's resolved world
+    position.
 
-        {"kind": "number_density", "nuclides": {"Fe56": 5.9e-2, ...}}   # atoms/b·cm
-        {"kind": "mass_density", "density": 0.85,
-         "nuclides": {"Na23": {"ao": 1.0, "M": 22.99}}}                 # g/cm³ + frac
+    build_solid() rotates about the LOCAL ORIGIN and then calls
+    place_origin_at(solid, center_coords), which is a pure translation. So
+
+        world_point = R(roll, pitch, yaw) · local_point + center_coords
+
+    and for a z-aligned envelope centred on the component's own axis the yaw
+    term drops out entirely: rotating about the local origin spins the component
+    about that very axis and leaves a circular envelope invariant. Hence the
+    world envelope is simply the local envelope translated by center_coords.
+
+    (Roll/pitch tilt the component out of the z direction, which no z-aligned
+    cylinder can represent; that case is warned about and placed upright.)
     """
-    kind = mat.get("kind", "number_density")
-    nucs = mat["nuclides"]
-    if kind == "number_density":
-        return {k: float(v) for k, v in nucs.items()}
-    if kind == "mass_density":
-        rho = float(mat["density"])
-        ao = {k: float(v["ao"]) for k, v in nucs.items()}
-        molar = {k: float(v["M"]) for k, v in nucs.items()}
-        tot = sum(ao.values())
-        if tot <= 0:
-            raise ValueError("atom fractions sum to zero")
-        ao = {k: v / tot for k, v in ao.items()}
-        m_avg = sum(ao[k] * molar[k] for k in ao)
-        n_tot = rho * N_A / m_avg
-        return {k: ao[k] * n_tot * 1e-24 for k in ao}
-    raise ValueError(f"unknown material kind {kind!r}")
+    cyl = result["cylinder"]
 
+    cc = spec.get("center_coords")
+    if cc is None and "center_coords_pol" in spec:
+        r, theta_deg, z = spec["center_coords_pol"]
+        rad = math.radians(theta_deg)
+        cc = (r * math.cos(rad), r * math.sin(rad), z)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ATOM-CONSERVING HOMOGENISATION  (pure python, unit-agnostic)
-# ─────────────────────────────────────────────────────────────────────────────
-def homogenise_volumes(
-    volume_by_material: Dict[str, float],
-    materials: Dict[str, Dict[str, Any]],
-    envelope_volume: float,
-) -> Dict[str, Any]:
-    """
-    Mix materials occupying known volumes into one envelope, conserving atoms.
+    roll, pitch, _yaw = spec.get("rotation_angles", (0.0, 0.0, 0.0))
+    if abs(roll) > 1e-9 or abs(pitch) > 1e-9:
+        warnings.warn(
+            f"{spec.get('obj_id')}: roll/pitch rotation ({roll}, {pitch}) cannot be "
+            f"represented by a z-aligned equivalent cylinder — placing it upright anyway."
+        )
 
-    All volumes are in the model's own length unit cubed; only their RATIO to
-    ``envelope_volume`` is ever used, so the result is unit-independent.
-
-    ``balance`` reports, per nuclide, the atom content of the sources versus the
-    atom content of the envelope. "Content" here is V·n in model units — it is
-    proportional to an atom count by a factor that depends on the length unit,
-    which cancels in the comparison.
-    """
-    if envelope_volume <= 0:
-        raise ValueError("envelope volume must be positive")
-    n_hom: Dict[str, float] = defaultdict(float)
-    source_content: Dict[str, float] = defaultdict(float)
-    for mat_name, vol in volume_by_material.items():
-        if vol <= 0:
-            continue
-        if mat_name not in materials:
-            raise KeyError(f"material {mat_name!r} used by geometry but absent from library")
-        fraction = vol / envelope_volume          # dimensionless — the whole trick
-        for nuc, n in material_number_densities(materials[mat_name]).items():
-            n_hom[nuc] += fraction * n
-            source_content[nuc] += vol * n
-    balance: Dict[str, Dict[str, float]] = {}
-    for nuc, nd in n_hom.items():
-        cell = nd * envelope_volume
-        src = source_content[nuc]
-        balance[nuc] = {
-            "number_density": nd,
-            "source_content": src,
-            "cell_content": cell,
-            "rel_error": abs(cell - src) / src if src else 0.0,
-        }
-    return {"number_densities": dict(n_hom), "balance": balance}
-
-
-def cylinder_volume(cyl: Dict[str, Any]) -> float:
-    """Volume of an equivalent cylinder, in model units cubed."""
-    return math.pi * float(cyl["radius"]) ** 2 * float(cyl["height"])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GENERIC PATH — works for premades, profile+operation and 3D primitives alike
-# ─────────────────────────────────────────────────────────────────────────────
-def build_local_solid(spec: Dict[str, Any]):
-    """
-    Build the component in its OWN LOCAL FRAME, through the same build_solid()
-    the assembler uses, with placement deliberately withheld.
-
-    Mirrors the dispatch in assemble_objects() so that all three build paths
-    produce exactly the solid the CAD assembly would produce, only un-placed:
-    build_solid applies rotation about the local origin and then translates the
-    origin onto center_coords, so withholding both leaves the local geometry.
-    """
-    from build_3D_solid import build_solid
-
-    s = {k: v for k, v in spec.items() if k not in _NON_GEOMETRY_KEYS}
-    s.pop("center_coords", None)
-    s.pop("center_coords_pol", None)
-    s.pop("rotation_angles", None)
-    operation = s.pop("operation", "primitive")
-
-    if "profile" in s:
-        solid, _ = build_solid(operation, **s)
-    elif "obj_type" in s:
-        solid, _ = build_solid(operation, dict(s), obj_id=s.get("obj_id"))
-    else:
-        solid, _ = build_solid(operation, **s)
-    return solid.val() if hasattr(solid, "val") else solid
-
-
-def bounding_cylinder(solid, tol: float = 1e-9) -> Dict[str, float]:
-    """
-    Z-aligned cylinder about the LOCAL ORIGIN that contains the solid.
-
-    The bounding box's corner distance always contains the solid, but for an
-    axisymmetric component it is a factor sqrt(2) too wide — which costs
-    nothing in atoms yet dilutes the homogenised densities over twice the
-    volume they belong in. So try the tighter radius (the largest bounding-box
-    extent) first and keep it if a single boolean confirms nothing pokes out.
-
-    Components whose axis is not the local Z axis get a generous envelope from
-    this; give them ``spec["hom_cylinder"]`` to tighten it.
-    """
-    bb = solid.BoundingBox()
-    r_corner = max(
-        math.hypot(x, y)
-        for x in (bb.xmin, bb.xmax)
-        for y in (bb.ymin, bb.ymax)
-    )
-    r_tight = max(abs(bb.xmin), abs(bb.xmax), abs(bb.ymin), abs(bb.ymax))
-    height = bb.zmax - bb.zmin
-    radius = r_corner
-    if r_tight < r_corner - tol and height > 0:
-        import cadquery as cq
-        probe = (cq.Workplane("XY").workplane(offset=(bb.zmin + bb.zmax) / 2.0)
-                 .cylinder(height * 1.01, r_tight).val())
-        try:
-            if solid.cut(probe).Volume() <= tol * max(solid.Volume(), 1.0):
-                radius = r_tight
-        except Exception:
-            pass  # keep the safe corner radius
-    return {"radius": radius, "z_bottom": bb.zmin, "height": height}
-
-
-def generic_zones(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Fallback zone model for any component without a MATERIAL_ZONES entry: the
-    whole solid is one zone, and the envelope is its own bounding cylinder.
-    Enough for every single-material component, whatever path built it.
-    """
-    solid = build_local_solid(spec)
+    off = (0.0, 0.0, 0.0) if cc is None else (float(cc[0]), float(cc[1]), float(cc[2]))
     return {
-        "zones": [Zone(SOLID_ZONE, "solid", solid.Volume())],
-        "cylinder": bounding_cylinder(solid),
-        "solids": {SOLID_ZONE: solid},
+        "x": off[0], "y": off[1],
+        "z_bottom": cyl["z_bottom"] + off[2],
+        "height": cyl["height"], "radius": cyl["radius"],
     }
 
 
-def zone_model(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Registered zone declaration if there is one, generic single zone otherwise."""
-    obj_type = spec.get("obj_type")
-    if obj_type in MATERIAL_ZONES:
-        return MATERIAL_ZONES[obj_type](spec)
-    return generic_zones(spec)
+def _z_overlap(a: Dict[str, float], b: Dict[str, float]) -> float:
+    return min(a["z_bottom"] + a["height"], b["z_bottom"] + b["height"]) - \
+           max(a["z_bottom"], b["z_bottom"])
 
 
-def _assignment(spec: Dict[str, Any], declared: set) -> Dict[str, Optional[str]]:
-    """
-    Resolve the zone -> material binding from either form:
-
-        "materials": {"structure": "ss316", "_filler": "na_primary"}   # multi-zone
-        "material": "ss316", "filler": "na_primary"                    # single zone
-    """
-    if "materials" in spec:
-        return dict(spec["materials"])
-    if "material" in spec:
-        if declared != {SOLID_ZONE}:
-            raise KeyError(
-                f"{spec.get('obj_type')!r} declares zones {sorted(declared)}, so it "
-                f"needs a 'materials' block binding each zone to a material; the "
-                f"single-material 'material' key is only valid for components with "
-                f"one zone."
-            )
-        out: Dict[str, Optional[str]] = {SOLID_ZONE: spec["material"]}
-        if spec.get("filler") is not None:
-            out[FILLER_KEY] = spec["filler"]
-        return out
-    raise KeyError(
-        f"{spec.get('obj_id', spec.get('obj_type'))}: no material assignment. Give "
-        f"'material' (single-material component) or 'materials' (zone -> material)."
-    )
+def _check_overlaps(placed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pairwise overlap of z-aligned cylinders: axes closer than r1+r2 AND
+    intersecting z-ranges. Fix by shrinking an envelope via spec['hom_cylinder']."""
+    out = []
+    for i in range(len(placed)):
+        for j in range(i + 1, len(placed)):
+            a, b = placed[i]["cylinder"], placed[j]["cylinder"]
+            dz = _z_overlap(a, b)
+            if dz <= 0:
+                continue
+            d = math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+            pen = a["radius"] + b["radius"] - d
+            if pen > 1e-9:
+                out.append({
+                    "pair": [placed[i]["name"], placed[j]["name"]],
+                    "radial_penetration": pen,
+                    "z_overlap": dz,
+                })
+    return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DRIVER
-# ─────────────────────────────────────────────────────────────────────────────
-def homogenise(
-    spec: Dict[str, Any],
+def homogenise_objects(
+    specs: List[Dict[str, Any]],
     materials: Optional[Dict[str, Dict[str, Any]]] = None,
-    cylinder: Optional[Dict[str, Any]] = None,
+    pool: Optional[Dict[str, Any]] = None,
+    settings: Optional[Dict[str, Any]] = None,
+    units: Optional[str] = None,
+    out_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Build the component described by ``spec``, measure each zone, assign
-    materials, and return the equivalent cylinder with conserved per-nuclide
-    number densities. Unit-agnostic throughout.
+    Homogenise a full reactor spec list (the same one assemble_objects takes)
+    into placed equivalent cylinders + pool + native vessel/plate, and
+    optionally write the result to ``out_path`` as JSON.
 
-    ``materials`` defaults to the central library in materials.py; pass a dict
-    only to override it (e.g. a temperature-perturbed composition set).
-
-    Returns a dict with:
-        obj_type          : the component type that was homogenised
-        cylinder          : radius / z_bottom / height (model units) + volume
-        number_densities  : {nuclide: atoms/b·cm} of the equivalent cylinder
-        balance           : per-nuclide source vs cylinder atom content
-        zones             : {zone: (role, volume)} as measured from the CAD solid
-        by_material       : total volume assigned to each material (incl. filler)
-        filler            : closure volume filled by the filler material
-        unfilled          : closure volume left as vacuum (no filler given)
-        closure           : |Σ zones + filler − V_cyl| / V_cyl, should be ~0
+    pool     : {"material": "na_primary"}  (required key: material)
+    settings : {"particles": .., "batches": .., "inactive": ..} merged over defaults
+    units    : PURE LABEL — the length unit the spec numbers are authored in
+               (e.g. "m", "cm"), exactly like assemble_objects()'s ``units=``.
+               Nothing is rescaled; the homogenisation stays unit-agnostic (only
+               volume ratios are used). It is recorded verbatim in the model's
+               ``unit`` field so a downstream reader (e.g. a future OpenMC
+               exporter, which requires cm) knows what the geometry lengths mean
+               and can convert them. ``None`` leaves the unit unspecified.
+               Number densities are ALWAYS atoms/b·cm, independent of this label.
     """
     if materials is None:
-        from materials import MATERIALS as materials  # central library default
+        from materials import MATERIALS as materials
+    pool = dict(pool or {})
+    pool_mat = pool.get("material", "na_primary")
 
-    model = zone_model(spec)
-    zones = model["zones"]
-    declared = {z.name for z in zones}
+    from component_resolver import resolve
+    from assemble import auto_generate_topplate_holes
 
-    assign = _assignment(spec, declared)
-    filler_mat = assign.pop(FILLER_KEY, None)
+    resolved = resolve(copy.deepcopy(specs))
+    # Same pre-pass the CAD assembly runs: without it the top plate is measured
+    # as an unperforated slab and its steel is over-counted by the penetrations.
+    auto_generate_topplate_holes(resolved)
 
-    used = set(assign)
-    missing = declared - used
-    unknown = used - declared
-    if missing:
-        raise KeyError(
-            f"{spec.get('obj_type')}: zones {sorted(missing)} have no material "
-            f"assigned. Declared zones: {sorted(declared)}."
+    notes: List[str] = []
+
+    # ── classify ────────────────────────────────────────────────────────────
+    cylinder_specs, smear_specs = [], []
+    vessel_spec = plate_spec = None
+    for spec in resolved:
+        t = _treatment(spec)
+        if t == "skip":
+            continue
+        if t == "vessel":
+            vessel_spec = spec
+        elif t == "plate":
+            plate_spec = spec
+        elif t == "smear":
+            smear_specs.append(spec)
+        elif t == "cylinder":
+            cylinder_specs.append(spec)
+        else:
+            raise ValueError(f"unknown neutronics_treatment {t!r}")
+
+    if vessel_spec is None:
+        raise ValueError("assembly needs exactly one reactor_vessel spec (pool boundary)")
+
+    # ── per-component homogenisation (cache identical geometries) ───────────
+    cache: Dict[str, Dict[str, Any]] = {}
+    components: List[Dict[str, Any]] = []
+    for spec in cylinder_specs:
+        key = _cache_key(spec)
+        if key not in cache:
+            kind = "premade" if spec.get("obj_type") in MATERIAL_ZONES else "generic"
+            print(f"  homogenising {str(spec.get('obj_type')):22s} "
+                  f"[{spec.get('obj_id')}] ({kind}) ...")
+            cache[key] = homogenise_solid(spec, materials)
+        else:
+            print(f"  reusing      {str(spec.get('obj_type')):22s} "
+                  f"[{spec.get('obj_id')}] (identical geometry)")
+        res = cache[key]
+        worst = max((b["rel_error"] for b in res["balance"].values()), default=0.0)
+        components.append({
+            "name": spec.get("obj_id", spec["obj_type"]),
+            "obj_type": spec["obj_type"],
+            "cylinder": _world_cylinder(spec, res),
+            "number_densities": res["number_densities"],
+            "qa": {
+                "worst_rel_atom_error": worst,
+                "closure": res["closure"],
+                "zones": res["zones"],
+                "filler": res["filler"],
+                "unfilled": res["unfilled"],
+                "by_material": res["by_material"],
+                # Atom content V_m * n_m,i contributed by each material, per
+                # nuclide. Volumes alone are NOT enough to split a blended cell
+                # back into its constituents: a reaction rate follows the atoms,
+                # and two materials sharing a nuclide (the primary and secondary
+                # sodium of an IHX) hold different numbers of it per unit volume.
+                # Summing this over materials reproduces V_cyl * n_hom,i, so it
+                # is the same conservation identity the homogenisation uses,
+                # reported per source instead of per cell.
+                "by_material_atoms": {
+                    m: {nuc: v * n for nuc, n
+                        in material_number_densities(materials[m]).items()}
+                    for m, v in res["by_material"].items()
+                },
+            },
+        })
+
+    overlaps = _check_overlaps(components)
+    for ov in overlaps:
+        warnings.warn(
+            f"equivalent cylinders overlap: {ov['pair']} "
+            f"(radial penetration {ov['radial_penetration']:.4g}, "
+            f"z overlap {ov['z_overlap']:.4g}). "
+            f"Shrink one with spec['hom_cylinder'] = {{'radius': ...}}."
         )
-    if unknown:
-        raise KeyError(
-            f"{spec.get('obj_type')}: material assignment names {sorted(unknown)}, "
-            f"which are not zones of this component. Valid zone names: {sorted(declared)}."
-        )
 
-    by_material: Dict[str, float] = defaultdict(float)
-    for z in zones:
-        by_material[assign[z.name]] += z.volume
+    # ── vessel (native): annulus + equivalent flat bottom ───────────────────
+    inner_d = vessel_spec.get("inner_d")
+    wall_t = vessel_spec.get("wall_t")
+    outer_d = vessel_spec.get("outer_d")
+    if inner_d is None:
+        inner_d = float(outer_d) - 2.0 * float(wall_t)
+    if outer_d is None:
+        outer_d = float(inner_d) + 2.0 * float(wall_t)
+    r_in, r_out = float(inner_d) / 2.0, float(outer_d) / 2.0
+    straight_h = float(vessel_spec.get("straight_h") or vessel_spec.get("height"))
 
-    # Envelope: explicit argument > spec["hom_cylinder"] override > declared default
-    cyl = dict(model["cylinder"])
-    if spec.get("hom_cylinder"):
-        cyl.update(spec["hom_cylinder"])
-    if cylinder is not None:
-        cyl.update(cylinder)
-    v_cyl = cylinder_volume(cyl)
-    cyl["volume"] = v_cyl
+    vessel_mat = _single_material(vessel_spec, "reactor_vessel")
+    v_vessel_cad = MATERIAL_ZONES["reactor_vessel"](vessel_spec)["zones"][0].volume
 
-    # Closure: the remainder of the cylinder is filler (or vacuum if unassigned)
-    v_zones = sum(z.volume for z in zones)
-    v_rest = v_cyl - v_zones
-    if v_rest < -1e-6 * v_cyl:
-        raise ValueError(
-            f"{spec.get('obj_type')}: declared zones ({v_zones:.6g}) exceed the "
-            f"equivalent-cylinder volume ({v_cyl:.6g}). Enlarge the envelope "
-            f"(spec['hom_cylinder']) or fix the zone volumes."
-        )
-    v_rest = max(v_rest, 0.0)
-    if filler_mat is not None and v_rest > 0.0:
-        by_material[filler_mat] += v_rest
+    # pool z-range: deep enough to contain every component cylinder
+    z_pool_top = float(plate_spec["z_bottom"]) if plate_spec else straight_h
+    z_pool_bot = min([0.0] + [c["cylinder"]["z_bottom"] for c in components])
 
-    hom = homogenise_volumes(dict(by_material), materials, v_cyl)
+    v_annulus = math.pi * (r_out**2 - r_in**2) * (straight_h - z_pool_bot)
+    t_bottom_eq = (v_vessel_cad - v_annulus) / (math.pi * r_out**2) if r_out > 0 else 0.0
+    if t_bottom_eq < 0:
+        notes.append(f"vessel: modelled annulus already exceeds CAD steel volume by "
+                     f"{-(v_vessel_cad - v_annulus):.4g}; bottom plate clamped to 0.")
+        t_bottom_eq = 0.0
+
+    vessel_out = {
+        "r_inner": r_in, "r_outer": r_out,
+        "z_bottom": z_pool_bot, "z_top": straight_h,
+        "bottom_plate_thickness": t_bottom_eq,
+        "material": vessel_mat,
+        "number_densities": material_number_densities(materials[vessel_mat]),
+        "qa": {"cad_steel": v_vessel_cad},
+    }
+
+    # ── helper: volume a cylinder takes out of a z-slab of the vessel bore ──
+    def _carved(z0: float, z1: float, r_bound: float, warn: bool) -> float:
+        v = 0.0
+        for c in components:
+            cyl = c["cylinder"]
+            dz = min(cyl["z_bottom"] + cyl["height"], z1) - max(cyl["z_bottom"], z0)
+            if dz <= 0:
+                continue
+            ax = math.hypot(cyl["x"], cyl["y"])
+            if warn and ax + cyl["radius"] > r_bound + 1e-9:
+                notes.append(f"{c['name']}: cylinder extends radially past r={r_bound:.4g} "
+                             f"(axis {ax:.4g} + r {cyl['radius']:.4g}); carve-out approximated.")
+            v += math.pi * cyl["radius"]**2 * dz
+        return v
+
+    # ── pool: vessel bore minus cylinders, + smeared steel (redan) ──────────
+    v_pool_base = math.pi * r_in**2 * (z_pool_top - z_pool_bot)
+    v_pool = v_pool_base - _carved(z_pool_bot, z_pool_top, r_in, warn=True)
+
+    smeared, v_smear_total = [], 0.0
+    smear_vols: Dict[str, float] = {}
+    for spec in smear_specs:
+        zmodel = (MATERIAL_ZONES[spec["obj_type"]](spec)
+                  if spec["obj_type"] in MATERIAL_ZONES else generic_zones(spec))
+        v = zmodel["zones"][0].volume
+        m = _single_material(spec, spec["obj_type"])
+        smear_vols[m] = smear_vols.get(m, 0.0) + v
+        v_smear_total += v
+        smeared.append({"name": spec.get("obj_id"), "material": m, "volume": v})
+        print(f"  smearing     {spec['obj_type']:22s} [{spec.get('obj_id')}] into pool "
+              f"({v:.4g} of {m})")
+
+    pool_mix = dict(smear_vols)
+    pool_mix[pool_mat] = pool_mix.get(pool_mat, 0.0) + (v_pool - v_smear_total)
+    pool_hom = homogenise_volumes(pool_mix, materials, v_pool)
+    pool_out = {
+        "radius": r_in, "z_bottom": z_pool_bot, "z_top": z_pool_top,
+        "material": pool_mat,
+        "number_densities": pool_hom["number_densities"],
+        "volume": v_pool,
+        "smeared": smeared,
+    }
+
+    # ── top plate (native): slab minus penetrations, steel conserved ────────
+    plate_out = None
+    if plate_spec is not None:
+        r_p = float(plate_spec["outer_d"]) / 2.0
+        z_p0 = float(plate_spec["z_bottom"])
+        t_p = float(plate_spec["thickness"])
+        plate_mat = _single_material(plate_spec, "reactor_top_plate")
+        v_plate_cad = MATERIAL_ZONES["reactor_top_plate"](plate_spec)["zones"][0].volume
+        v_slab_model = math.pi * r_p**2 * t_p - _carved(z_p0, z_p0 + t_p, r_p, warn=False)
+        plate_hom = homogenise_volumes({plate_mat: v_plate_cad}, materials, v_slab_model)
+        plate_out = {
+            "radius": r_p, "z_bottom": z_p0, "z_top": z_p0 + t_p,
+            "material": plate_mat,
+            "number_densities": plate_hom["number_densities"],
+            "qa": {"cad_steel": v_plate_cad, "model_cell": v_slab_model},
+        }
+
+    # ── settings / source ───────────────────────────────────────────────────
+    core = next((c for c in components if c["obj_type"] == "reactor_core"), None)
+    settings_out = {"particles": 10000, "batches": 50, "inactive": 10}
+    settings_out.update(settings or {})
+    if core is not None:
+        settings_out["source_cylinder"] = core["cylinder"]
+    else:
+        notes.append("no reactor_core component — source defaults to the origin.")
+
+    model = {
+        "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+        # Length unit the geometry is authored in, as declared by the caller
+        # (a pure label — nothing was rescaled). None => unspecified. A reader
+        # that needs a concrete unit (OpenMC wants cm) converts from this.
+        "unit": units,
+        "number_density_unit": "atoms/b·cm",
+        "components": components,
+        "pool": pool_out,
+        "vessel": vessel_out,
+        "plate": plate_out,
+        "settings": settings_out,
+        "qa": {
+            "overlaps": overlaps,
+            "worst_rel_atom_error": max(
+                (c["qa"]["worst_rel_atom_error"] for c in components), default=0.0),
+            "worst_closure": max(
+                (c["qa"]["closure"] for c in components), default=0.0),
+            "notes": notes,
+        },
+    }
+
+    if out_path is not None:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w") as fh:
+            json.dump(model, fh, indent=2)
+        print(f"Homogenised model written: {out_path}")
+
+    return model
+
+
+def _single_material(spec: Dict[str, Any], what: str) -> str:
+    """Material of a component the assembly keeps native (vessel/plate/smeared)."""
+    if "materials" in spec:
+        mats = {k: v for k, v in spec["materials"].items() if k != FILLER_KEY}
+        if len(mats) != 1:
+            raise KeyError(
+                f"{what}: expected exactly one material zone, got {sorted(mats)}."
+            )
+        return next(iter(mats.values()))
+    if "material" in spec:
+        return spec["material"]
+    raise KeyError(f"{what}: no 'material' or 'materials' assignment on the spec.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAD OUTPUT — the homogenised model as buildable geometry
+# ─────────────────────────────────────────────────────────────────────────────
+def to_cad_specs(model: Dict[str, Any], prefix: str = "hom_") -> List[Dict[str, Any]]:
+    """
+    The homogenised model as a spec list assemble_objects() can build directly:
+    one cylinder primitive per component, the vessel wall as a pipe, and — when
+    it has positive thickness — the vessel's equivalent flat bottom as a solid
+    disc closing the bore. These cells do not overlap one another, so the CAD
+    assembly's own overlap detection acts as an independent check on the
+    equivalent-cylinder layout.
+
+    Each spec carries its homogenised composition in "number_densities" for the
+    downstream OpenMC export; assemble_objects ignores the key.
+    """
+    specs: List[Dict[str, Any]] = []
+    for c in model["components"]:
+        cyl = c["cylinder"]
+        specs.append({
+            "obj_type": "cylinder",
+            "obj_id": f"{prefix}{c['name']}",
+            "radius": cyl["radius"],
+            "height": cyl["height"],
+            "center_coords": (cyl["x"], cyl["y"], cyl["z_bottom"] + cyl["height"] / 2.0),
+            "number_densities": c["number_densities"],
+        })
+
+    v = model["vessel"]
+    specs.append({
+        "obj_type": "pipe",
+        "obj_id": f"{prefix}vessel",
+        "height": v["z_top"] - v["z_bottom"],
+        "outer_radius": v["r_outer"],
+        "inner_radius": v["r_inner"],
+        "center_coords": (0.0, 0.0, (v["z_bottom"] + v["z_top"]) / 2.0),
+        "material": v["material"],
+        "number_densities": v["number_densities"],
+    })
+    # Equivalent flat bottom: a solid disc (full outer radius) that closes the
+    # bore just below the annular wall and carries the vessel steel the annulus
+    # doesn't. Drawn only when it has positive thickness — t_bottom_eq is clamped
+    # to 0 when the modelled annulus already accounts for all the CAD steel.
+    t_bottom = v.get("bottom_plate_thickness", 0.0)
+    if t_bottom > 0.0:
+        specs.append({
+            "obj_type": "cylinder",
+            "obj_id": f"{prefix}vessel_bottom",
+            "radius": v["r_outer"],
+            "height": t_bottom,
+            "center_coords": (0.0, 0.0, v["z_bottom"] - t_bottom / 2.0),
+            "material": v["material"],
+            "number_densities": v["number_densities"],
+        })
+    return specs
+
+
+def _slab_minus_components(model, radius, z0, z1):
+    """A z-slab of the given radius with every component cylinder cut out."""
+    import cadquery as cq
+    solid = (cq.Workplane("XY").workplane(offset=(z0 + z1) / 2.0)
+             .cylinder(z1 - z0, radius))
+    for c in model["components"]:
+        cyl = c["cylinder"]
+        dz = min(cyl["z_bottom"] + cyl["height"], z1) - max(cyl["z_bottom"], z0)
+        if dz <= 0:
+            continue
+        zc = (max(cyl["z_bottom"], z0) + min(cyl["z_bottom"] + cyl["height"], z1)) / 2.0
+        cutter = (cq.Workplane("XY").workplane(offset=zc)
+                  .center(cyl["x"], cyl["y"]).cylinder(dz * 1.001, cyl["radius"]))
+        solid = solid.cut(cutter)
+    return solid
+
+
+def build_cad(
+    model: Dict[str, Any],
+    include_pool: bool = True,
+    include_plate: bool = True,
+    export_path: Optional[str] = None,
+    units: Optional[str] = None,
+    prefix: str = "hom_",
+):
+    """
+    Build the homogenised model as a CadQuery assembly: one solid per cell.
+
+    ``units`` is OPTIONAL and means exactly what it means for
+    assemble_objects() — the unit the model's numbers are in, written into the
+    STEP header. The homogenisation itself never needed it. Omitted, it is taken
+    from the model's own ``unit`` field, which homogenise_objects() recorded
+    from the caller: the model already knows what it is written in, so the
+    export cannot silently disagree with it. Only a model carrying no unit at
+    all falls back to the repo convention (metres), with a warning.
+    """
+    import cadquery as cq
+    from assemble import assemble_objects, _color_from_id
+
+    specs = to_cad_specs(model, prefix=prefix)
+    assy = assemble_objects(specs, export_path=None)
+
+    if include_pool:
+        p = model["pool"]
+        pool_solid = _slab_minus_components(model, p["radius"], p["z_bottom"], p["z_top"])
+        assy.add(pool_solid, name=f"{prefix}pool", color=cq.Color(0.35, 0.55, 0.85, 0.35))
+
+    if include_plate and model.get("plate"):
+        pl = model["plate"]
+        plate_solid = _slab_minus_components(model, pl["radius"], pl["z_bottom"], pl["z_top"])
+        assy.add(plate_solid, name=f"{prefix}plate", color=_color_from_id("plate"))
+
+    if export_path is not None:
+        if units is None:
+            # The model records the unit its author declared to
+            # homogenise_objects(). Prefer it over any assumed default: it is
+            # the only unit the numbers are actually known to be in, and these
+            # models are commonly authored in cm (OpenMC's unit), where
+            # guessing metres would be wrong by a factor of 100.
+            from assemble import _DEFAULT_STEP_UNITS
+            units = model.get("unit") or _DEFAULT_STEP_UNITS
+            if model.get("unit") is None:
+                warnings.warn(
+                    f"build_cad: no 'units' given and the model carries no "
+                    f"'unit' field — declaring {units!r} in the STEP header. "
+                    f"Pass units= if the model numbers are in another unit.",
+                    stacklevel=2,
+                )
+        from assemble import _STEP_UNITS, _patch_step_names
+        unit_key = str(units).lower()
+        if unit_key not in _STEP_UNITS:
+            raise ValueError(f"build_cad: unknown units {units!r}. Accepted: "
+                             + ", ".join(sorted(_STEP_UNITS)) + ".")
+        from OCP.STEPControl import STEPControl_Writer   # type: ignore
+        from OCP.Interface import Interface_Static       # type: ignore
+        STEPControl_Writer()
+        if not Interface_Static.SetCVal_s("write.step.unit", _STEP_UNITS[unit_key]):
+            raise RuntimeError(f"Could not set the STEP unit {_STEP_UNITS[unit_key]!r}.")
+        parent = os.path.dirname(export_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        cq.exporters.export(assy.toCompound(), export_path)
+        _patch_step_names(export_path, [ch.name for ch in assy.children])
+        print(f"Homogenised CAD exported to: {export_path}")
+
+    return assy
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QA — independent checks against the real CAD assembly
+# ─────────────────────────────────────────────────────────────────────────────
+def check_against_cad(model: Dict[str, Any], specs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Compare the homogenised model with the CAD assembly built from the same
+    specs. Independent of the numbers the homogeniser produced, so unlike the
+    per-nuclide balance (which is true by construction) this can actually fail.
+
+      placement : each equivalent cylinder's z-range vs the real solid's world
+                  bounding box — catches any drift in the placement convention
+      inventory : total component volume, CAD vs homogenised envelopes
+    """
+    from assemble import assemble_objects
+
+    assy = assemble_objects(copy.deepcopy(specs), export_path=None)
+    cad = {}
+    for ch in assy.children:
+        try:
+            bb = ch.obj.val().BoundingBox()
+        except Exception:
+            continue
+        loc = ch.loc.toTuple()[0] if ch.loc else (0.0, 0.0, 0.0)
+        cad[ch.name] = {"z0": bb.zmin + loc[2], "z1": bb.zmax + loc[2],
+                        "volume": ch.obj.val().Volume()}
+
+    rows = []
+    for c in model["components"]:
+        ref = cad.get(c["name"])
+        if ref is None:
+            continue
+        cyl = c["cylinder"]
+        rows.append({
+            "name": c["name"],
+            "cad_z": (ref["z0"], ref["z1"]),
+            "cyl_z": (cyl["z_bottom"], cyl["z_bottom"] + cyl["height"]),
+            "dz_bottom": cyl["z_bottom"] - ref["z0"],
+            "cad_volume": ref["volume"],
+            "envelope_volume": cylinder_volume(cyl),
+        })
     return {
-        "obj_type": spec.get("obj_type"),
-        "cylinder": cyl,
-        "number_densities": hom["number_densities"],
-        "balance": hom["balance"],
-        "zones": {z.name: (z.role, z.volume) for z in zones},
-        "by_material": dict(by_material),
-        "filler": v_rest if filler_mat is not None else 0.0,
-        "unfilled": 0.0 if filler_mat is not None else v_rest,
-        "closure": abs(sum(by_material.values()) - v_cyl) / v_cyl,
+        "placement": rows,
+        "worst_dz_bottom": max((abs(r["dz_bottom"]) for r in rows), default=0.0),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Self-test (pure math — no CadQuery)
-# ─────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    materials = {
-        "ss316": {"kind": "number_density",
-                  "nuclides": {"Fe56": 5.9e-2, "Cr52": 1.6e-2, "Ni58": 8.0e-3}},
-        "na": {"kind": "mass_density", "density": 0.85,
-               "nuclides": {"Na23": {"ao": 1.0, "M": 22.99}}},
-    }
+def print_report(model: Dict[str, Any], cad_check: Optional[Dict[str, Any]] = None) -> None:
+    """Human-readable summary of a homogenised model."""
+    print("\n── homogenised cells " + "─" * 52)
+    print(f"{'cell':24s} {'x':>8s} {'y':>8s} {'r':>7s} {'z_bottom':>9s} {'z_top':>9s}")
+    for c in model["components"]:
+        cy = c["cylinder"]
+        print(f"{c['name']:24s} {cy['x']:8.3f} {cy['y']:8.3f} {cy['radius']:7.3f} "
+              f"{cy['z_bottom']:9.3f} {cy['z_bottom'] + cy['height']:9.3f}")
+    v, p = model["vessel"], model["pool"]
+    print(f"{'vessel':24s} {'':8s} {'':8s} {v['r_outer']:7.3f} "
+          f"{v['z_bottom']:9.3f} {v['z_top']:9.3f}   (bore {v['r_inner']:.3f}, "
+          f"equivalent bottom {v['bottom_plate_thickness']:.4f})")
+    print(f"{'pool':24s} {'':8s} {'':8s} {p['radius']:7.3f} "
+          f"{p['z_bottom']:9.3f} {p['z_top']:9.3f}   (volume {p['volume']:.4g})")
 
-    hom = homogenise_volumes({"ss316": 1234.0, "na": 8765.0}, materials, 50000.0)
-    worst = max(b["rel_error"] for b in hom["balance"].values())
-    for nuc, b in hom["balance"].items():
-        print(f"  {nuc:6s} n_hom={b['number_density']:.4e}  rel_err={b['rel_error']:.2e}")
-    print(f"worst relative atom error: {worst:.2e}")
-    assert worst < 1e-12
-
-    # Unit-invariance: scaling every length by k scales every volume by k³ and
-    # must leave the homogenised number densities untouched.
-    k = 1000.0
-    scaled = homogenise_volumes(
-        {"ss316": 1234.0 * k**3, "na": 8765.0 * k**3}, materials, 50000.0 * k**3
-    )
-    drift = max(
-        abs(scaled["number_densities"][n] - hom["number_densities"][n])
-        / hom["number_densities"][n]
-        for n in hom["number_densities"]
-    )
-    print(f"number-density drift over a {k:g}x unit change: {drift:.2e}")
-    assert drift < 1e-12
-
-    print("\nUsage (needs CadQuery + the components package):")
-    print("  from materials import MATERIALS")
-    print("  result = homogenise(ihx_spec, MATERIALS)   # ihx_spec['obj_type']=='ihx'")
+    print("\n── QA " + "─" * 67)
+    q = model["qa"]
+    print(f"  overlaps                : {[o['pair'] for o in q['overlaps']] or 'none'}")
+    print(f"  worst volume closure    : {q['worst_closure']:.2e}")
+    print(f"  worst atom balance      : {q['worst_rel_atom_error']:.2e}  "
+          f"(true by construction — see check_against_cad for a real test)")
+    if cad_check is not None:
+        print(f"  worst placement error   : {cad_check['worst_dz_bottom']:.2e} "
+              f"(equivalent cylinder z_bottom vs CAD solid)")
+    for n in dict.fromkeys(q["notes"]):
+        print(f"  note: {n}")

@@ -1,0 +1,12 @@
+region,name,ref_porosity,cad_porosity,delta,porosity_zones,open_fraction,slack_fraction,cad_source,note
+I,Spherical bottom,0.84,,,,,,vessel_bottom,boundary — no CAD component
+II,Lower strongback + core catcher,0.95,0.2796,-0.6704,0.0,0.2796,0.2796,strongback,
+III,Upper strongback,0.81,0.2796,-0.5304,0.0,0.2796,0.2796,strongback,
+IV,Diagrid,0.85,0.9225,0.0725,0.8549,0.9225,0.0676,diagrid,
+V,Core bypass,0.05,0.0,-0.05,0.0,0.0,0.0,core,
+VI,Upper plenum,1.0,0.99,-0.01,0.99,0.99,0.0,pool,pool sodium (redan smeared)
+VII,Above core structure,0.4,0.8819,0.4819,0.0,0.8819,0.8819,above_core_structure,
+VIII,IHX,0.56,0.611,0.051,0.5489,0.9137,0.0621,ihx_1,
+IX,Primary pump,0.76,0.8706,0.1106,0.0,0.8706,0.8706,pump_1,
+X,Cold plenum,1.0,0.99,-0.01,0.99,0.99,0.0,pool,pool sodium (redan smeared)
+XI,Outer space,0.0,,,,,,boundary,boundary — no CAD component

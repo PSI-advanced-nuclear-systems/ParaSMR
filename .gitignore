@@ -18,9 +18,15 @@ examples_reactor/sealer_55_detailed.step
 # Internal AI / working notes
 main_claude.md
 claude_mds/
+zzz_TRACE_not_ok/
+examples_reactor/costs_reports_not_ok/
+zzz_cost_report.py
 
 # Docs
 docs/
 
 # macOS
 .DS_Store
+
+# Serpent-derived core model (not cleared for public release)
+IntegrationOpenMC/main_no_ihx_serpent_2.py

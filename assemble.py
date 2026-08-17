@@ -3,9 +3,12 @@ Assembly and validation workflow for reactor components.
 
 UNITS: Geometry is UNIT-AGNOSTIC — choose one consistent unit system for all
 inputs (metres, millimetres, ...). Units exist in exactly one place: the
-required `units=` argument of assemble_objects() when exporting, which sets
+optional `units=` argument of assemble_objects() when exporting, which sets
 the STEP file's length-unit declaration so the file means what the spec
 meant (previously OCCT silently declared millimetres regardless of input).
+Omitting it falls back to metres — the convention used throughout this
+repo — with a warning, so a spec written in other units is exported
+correctly by passing units= explicitly.
 
 Key features:
   • Resolver integration: automatically applies connection rules to compute
@@ -41,8 +44,8 @@ from components_premade.components_premade_top_plate import _hole_centers
 # "unexpected keyword argument". Single definition, used by BOTH
 # validate_solids and assemble_objects so the two can never drift apart.
 #
-# The second row is read by the homogeniser (homogenise.py /
-# homogenise_assembly.py), which takes the very same spec list this function
+# The second row is read by the homogeniser (homogenise_solid.py /
+# homogenise.py), which takes the very same spec list this function
 # does. Premade and primitive specs survive an unknown key regardless — those
 # branches pass the dict positionally — but profile-based specs are expanded
 # with **, so a spec carrying them must have them stripped here or it raises.
@@ -60,6 +63,10 @@ _STEP_UNITS = {
     "m": "M", "mm": "MM", "cm": "CM", "um": "UM", "km": "KM",
     "inch": "INCH", "ft": "FT",
 }
+
+# Assumed when a caller exports without naming its units: metres, the
+# convention every example and the resolver's defaults are written in.
+_DEFAULT_STEP_UNITS = "m"
 
 
 def _color_from_id(obj_id: str) -> cq.Color:
@@ -447,8 +454,7 @@ def _check_built_solid(solid: cq.Workplane | None, obj_id: str) -> None:
 
 
 def assemble_objects(object_specs: List[Dict[str, Any]], export_path: str | None = None,
-                     units: str | None = None,
-                     costs_report: bool | Dict[str, Any] = False) -> cq.Assembly:
+                     units: str | None = None) -> cq.Assembly:
     """
     Build a list of objects and assemble them.
 
@@ -456,11 +462,13 @@ def assemble_objects(object_specs: List[Dict[str, Any]], export_path: str | None
     applied automatically, so callers only need to define geometry dicts,
     pass them here, and call show() on the result.
 
-    units — REQUIRED whenever export_path is given: the unit your spec
-    numbers are in (e.g. "m", "mm", "cm"). It is written into the STEP
-    header so the file is physically correct; the geometry itself stays
-    unit-agnostic and no numbers are rescaled. Viewer-only calls (no
-    export_path) need no units.
+    units — OPTIONAL: the unit your spec numbers are in (e.g. "m", "mm",
+    "cm"). It is written into the STEP header so the file is physically
+    correct; the geometry itself stays unit-agnostic and no numbers are
+    rescaled. When exporting without it, metres are assumed (the repo-wide
+    convention) and a warning is emitted — pass units= explicitly for a
+    spec written in anything else. Viewer-only calls (no export_path)
+    ignore units entirely.
 
     Geometry validation happens INLINE in the build loop: each solid is
     checked (build failure / null shape / zero volume) right after it is
@@ -470,37 +478,6 @@ def assemble_objects(object_specs: List[Dict[str, Any]], export_path: str | None
     STEP export: part names (obj_id) are written into the exported STEP
     file.
 
-    costs_report — when True, writes a materials/cost .xlsx (see
-    cost_report.py) named after the SCRIPT THAT CALLED THIS FUNCTION:
-
-        <that script's dir>/costs_reports/<stem>_costs_reports_<date_time>.xlsx
-
-    so calling it from example_final_esfr_smr_with_materials.py yields
-    costs_reports/example_final_esfr_smr_with_materials_costs_reports_20260722_143000.xlsx.
-    Prices come from cost_report.COSTS (currency per KILOGRAM) and densities
-    from materials.py; every spec must carry a 'material' / 'materials'
-    assignment. What the components are MADE OF is billed, not what they hold:
-    fluid zones and coolant are left out.
-
-    Pass a DICT instead of True to set any write_cost_report() option without
-    leaving this call — the report has several knobs and giving each its own
-    keyword here would bloat this signature for something most callers never
-    touch:
-
-        costs_report=True                              # defaults
-        costs_report={"costs": MY_PRICES, "currency": "USD"}
-        costs_report={"materials": MY_LIB}
-        costs_report={"out_path": "bom.xlsx"}
-
-    An empty dict means "report, all defaults", same as True; False means no
-    report. This makes `units` REQUIRED
-    even without an export_path —
-    volume becomes mass only once a model unit means something. The report
-    always measures RESOLVED specs — it re-runs the resolver and the top-plate
-    hole pass itself rather than trusting a caller to have done it — and the
-    zone functions rebuild each component to measure it, so expect a report to
-    roughly double the build time.
-
     NOTE — sub-part naming is currently DISABLED. The `_ihx_subnames`
     sidecar mechanism (per-instance sub-part names like "ihx_1_tube_bundle")
     assumed compound components; today every builder fuses its internals
@@ -509,30 +486,6 @@ def assemble_objects(object_specs: List[Dict[str, Any]], export_path: str | None
     The plumbing is kept commented out below for a potential re-enable.
     """
     from build_3D_solid import build_solid
-
-    # Normalised once: False/None = no report, True = defaults, dict = options.
-    # An empty dict is still a request for a report, so this cannot be a plain
-    # truthiness test.
-    report_opts: Dict[str, Any] | None = None
-    if costs_report is not False and costs_report is not None:
-        report_opts = dict(costs_report) if isinstance(costs_report, dict) else {}
-        clash = {"specs", "units", "object_specs"} & set(report_opts)
-        if clash:
-            raise ValueError(
-                f"assemble_objects: costs_report option(s) {sorted(clash)} are "
-                f"set by this function and cannot be overridden."
-            )
-
-    # Checked up front, not at the report call further down — a spec list that
-    # cannot produce the report it asked for should say so before spending
-    # minutes building geometry.
-    if report_opts is not None and units is None:
-        raise ValueError(
-            "assemble_objects: 'units' is required when costs_report=True — the "
-            "report prices materials per kilogram, so it has to know what one "
-            "model length unit is to turn volumes into masses. Accepted: "
-            + ", ".join(sorted(_STEP_UNITS)) + "."
-        )
 
     for d in object_specs:
         d.setdefault("operation", "primitive")
@@ -676,11 +629,16 @@ def assemble_objects(object_specs: List[Dict[str, Any]], export_path: str | None
     # ── STEP export (overlap shapes excluded) ──────────────────────────
     if export_path is not None:
         if units is None:
-            raise ValueError(
-                "assemble_objects: 'units' is required when exporting — the "
-                "STEP format demands a length-unit declaration (previously "
-                "OCCT silently wrote millimetres regardless of input). "
-                "Accepted: " + ", ".join(sorted(_STEP_UNITS)) + "."
+            # The STEP format demands a length-unit declaration, so assume
+            # the repo convention rather than blocking the export (before
+            # this argument existed, OCCT silently wrote millimetres).
+            units = _DEFAULT_STEP_UNITS
+            warnings.warn(
+                f"assemble_objects: no 'units' given — declaring "
+                f"{units!r} in the STEP header. Pass units= "
+                "(" + ", ".join(sorted(_STEP_UNITS)) + ") if the spec "
+                "numbers are in another unit.",
+                stacklevel=2,
             )
         unit_key = str(units).lower()
         if unit_key not in _STEP_UNITS:
@@ -710,17 +668,6 @@ def assemble_objects(object_specs: List[Dict[str, Any]], export_path: str | None
             # subnames_per_obj=subnames_per_obj,
         )
         print(f"Assembly exported to: {export_path}")
-
-    # ── Materials / cost report ────────────────────────────────────────
-    # object_specs are already resolved and hole-generated here; the report
-    # re-runs both passes anyway (they are idempotent) so that it can never
-    # measure a component at its pre-resolver dimensions, whoever calls it.
-    # caller_report_path is called from THIS frame and told to skip this file,
-    # so the name it picks is the user's script, not assemble.py.
-    if report_opts is not None:
-        from cost_report import write_cost_report, caller_report_path
-        report_opts.setdefault("out_path", caller_report_path(skip=(__file__,)))
-        write_cost_report(object_specs, units=cast(str, units), **report_opts)
 
     # ── Add overlap solids for viewer only (after STEP export) ─────────
     for overlap_name, overlap_wp in overlap_shapes:

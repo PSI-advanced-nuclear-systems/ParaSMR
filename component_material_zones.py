@@ -9,7 +9,7 @@ each zone's volume, looks up the material the user assigned to that zone name,
 and conserves atoms into a single cylinder.
 
 Registration is OPTIONAL. A component with no entry here is homogenised
-generically by ``homogenise.generic_zones``: built through the same build_solid()
+generically by ``homogenise_solid.generic_zones``: built through the same build_solid()
 the assembler uses, treated as one zone of one material, with its own bounding
 cylinder as the envelope. That covers every single-material component on all
 three build paths (premade, 2D profile + operation, CadQuery 3D primitive). Add
@@ -136,7 +136,7 @@ def _ihx_ring_positions(spec: Dict[str, Any]) -> List[Tuple[float, float, float,
 #  fused solid. The steel comes from the assembly's own builder; the tube-side
 #  region is rebuilt here from the same parameters create_ihx() uses and then cut
 #  against that structure — so the two must be kept in step. The closure figure
-#  reported by homogenise() is the guard:
+#  reported by homogenise_solid() is the guard:
 #  if this reconstruction drifts from create_ihx(), zone volumes stop summing to
 #  the envelope and the discrepancy shows up there.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,7 +403,7 @@ def reactor_top_plate_zones(spec: Dict[str, Any]) -> Dict[str, Any]:
 #  Registry  (extend like component_anchors / PREMADE_BUILDERS)
 #
 #  Only components whose internals need more than one material belong here.
-#  Anything absent is homogenised generically by homogenise.generic_zones().
+#  Anything absent is homogenised generically by homogenise_solid.generic_zones().
 # ─────────────────────────────────────────────────────────────────────────────
 MATERIAL_ZONES: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "ihx":                  ihx_zones,
