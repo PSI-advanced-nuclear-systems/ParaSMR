@@ -24,8 +24,6 @@ dependencies = [
     "Shapely==2.1.2",
     "ocp_vscode==3.1.2",
     "numpy",
-    "python-dotenv",
-    "openpyxl",
 ]
 
 [tool.setuptools]
@@ -36,10 +34,12 @@ py-modules = [
     "component_material_zones",
     "component_resolver",
     "components_3D_primitives",
+    "esfr_smr_specs",
     "homogenise_solid",
     "homogenise",
     "materials",
     "porosity",
+    "porosity_table",
     "profile_built_in_2D_sketch",
     "profile_from_straight_connections",
     "utils",
