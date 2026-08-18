@@ -7,6 +7,23 @@ file includes what each material is. There are two accepted forms per material:
     "number_density"  ->  nuclide: atoms/b·cm           (the simple, preferred form)
     "mass_density"    ->  density (g/cm³) + nuclide: {ao: atom_frac, M: molar_mass}
 
+SCOPE — this is a small illustrative set, not a validated library. Every entry
+below is chosen only to make the ESFR-SMR example run end to end:
+
+  • the sodium densities are those of sodium at ONE assumed operating
+    temperature, noted per entry. Nothing here derives a density from a
+    temperature, and no temperature is stored with a material — the numbers are
+    plain data. Modelling another state means supplying different numbers.
+  • the steels carry round placeholder number densities.
+  • core_smear is a single homogenised fuel composition, not a burnup state.
+
+Replace it for real work. Every entry point (homogenise_solid, homogenise_objects)
+takes the library as an OPTIONAL argument, defaulting to this file, so another
+dict of the same shape can be passed without editing anything here.
+
+NOTE — the temperature implied by these densities is unrelated to the
+cross-section temperature a transport code is run at (IntegrationOpenMC sets
+900 K). Nothing checks that the two describe the same physical state.
 """
 
 MATERIALS = {
