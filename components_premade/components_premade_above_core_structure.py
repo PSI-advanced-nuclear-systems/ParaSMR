@@ -60,8 +60,8 @@ def create_above_core_structure(
     # cylinder is translated by this offset. Set to (0, 0) for a coaxial
     # component; nonzero to displace the top cylinder sideways (e.g. to
     # clear pumps / IHX nozzles in the assembly).
-    top_cyl_offset_x: float,
-    top_cyl_offset_y: float,
+    top_cyl_offset_x: float = 0.0,
+    top_cyl_offset_y: float = 0.0,
     flow_hole_groups: list[dict] | None = None,
     # dict with keys:
     #   "through_d":          inner bore diameter                  (required)

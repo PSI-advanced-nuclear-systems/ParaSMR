@@ -119,9 +119,12 @@ def _world_cylinder(spec: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, f
 
     cc = spec.get("center_coords")
     if cc is None and "center_coords_pol" in spec:
-        r, theta_deg, z = spec["center_coords_pol"]
-        rad = math.radians(theta_deg)
-        cc = (r * math.cos(rad), r * math.sin(rad), z)
+        # theta is in RADIANS, exactly as build_solid() reads it. Resolved
+        # through the same helper so the CAD and homogenised placements can
+        # never drift apart (this once read the angle as degrees, which put a
+        # polar-placed component at a different azimuth in the two models).
+        from utils import convert_polar_to_cartesian
+        cc = convert_polar_to_cartesian(*spec["center_coords_pol"])
 
     roll, pitch, _yaw = spec.get("rotation_angles", (0.0, 0.0, 0.0))
     if abs(roll) > 1e-9 or abs(pitch) > 1e-9:
